@@ -17,3 +17,21 @@ services:
       - key: GIGACHAT_MODEL
         value: GigaChat
       - key: GIGACHAT_VERIFY_SSL
+        value: "false"
+      - key: ALLOWED_ORIGINS
+        value: "https://presentator-frontend.onrender.com"
+
+  # ---------- Frontend: статическая сборка Vite ----------
+  - type: web
+    name: presentator-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        value: "https://presentator-backend.onrender.com/api"
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
