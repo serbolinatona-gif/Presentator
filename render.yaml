@@ -1,0 +1,35 @@
+services:
+  # ---------- Backend: FastAPI ----------
+  - type: web
+    name: presentator-backend
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GIGACHAT_AUTH_KEY
+        sync: false
+      - key: GIGACHAT_SCOPE
+        value: GIGACHAT_API_PERS
+      - key: GIGACHAT_MODEL
+        value: GigaChat
+      - key: GIGACHAT_VERIFY_SSL
+        value: "false"
+      - key: ALLOWED_ORIGINS
+        value: "https://presentator-frontend.onrender.com"
+
+  # ---------- Frontend: статическая сборка Vite ----------
+  - type: web
+    name: presentator-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        value: "https://presentator-backend.onrender.com/api"
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
