@@ -1,14 +1,21 @@
 """
 pptx_builder.py
-Сборка готового .pptx файла из сгенерированного контента слайдов,
-с фоновыми изображениями (или градиентной заглушкой) и РАЗНОЙ вёрсткой под каждый
-из 5 стилей — как в реальных профессиональных шаблонах, а не один и тот же макет.
+Сборка .pptx с двумя независимыми слоями:
+1. Стиль (style) — задаёт фон, палитру, шрифты и декоративный "фрейм" слайда
+   (draw_style_frame). Раньше стили были почти незаметны, потому что фоновая
+   картинка на весь слайд перекрывала всё оформление — теперь картинка ставится
+   в отдельную область рядом с текстом, а не на фон.
+2. Раскладка (layout) — задаёт геометрию/структуру конкретного слайда (9 типов:
+   title, toc, thesis_proof, dense_text, concept_anatomy, comparison,
+   causal_chain, quote_context, conclusion). Раскладка использует цвета/шрифты
+   стиля, но сама геометрия одинакова независимо от стиля — так 5 стилей x 9
+   раскладок не превращаются в 45 отдельных функций.
 
-Исправленный баг: слайд.fill.transparency НЕ существует в публичном API python-pptx
-(это не задокументированное свойство — при вызове бросало AttributeError, из-за чего
-сборка презентации падала в середине, и пользователь получал pptx без стилей/картинок,
-собранный из fallback-кода). Прозрачность теперь выставляется вручную через прямую
-работу с XML (oxml), как это единственно возможно сделать в python-pptx.
+Известное упрощение: для concept_anatomy не рисуются линии-выноски (leader lines)
+от картинки к пунктам — в python-pptx это делается через произвольные connector-
+shapes с точными координатами и на практике выглядит хрупко при разных
+пропорциях картинок. Вместо этого части располагаются явным аккуратным списком
+под определением, что тоже читаемо и профессионально выглядит.
 """
 
 import io
@@ -17,60 +24,69 @@ from typing import List, Optional
 
 import httpx
 from lxml import etree
+from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import PP_ALIGN
-from pptx.util import Emu, Inches, Pt
+from pptx.util import Inches, Pt
 
 logger = logging.getLogger("slideforge.pptx_builder")
 
 SLIDE_W = Inches(13.333)
 SLIDE_H = Inches(7.5)
+MARGIN = Inches(0.7)
 
-STYLE_PRESETS = {
+# ---------------------------------------------------------------------------
+# Стили — палитра/шрифты/декор
+# ---------------------------------------------------------------------------
+
+STYLE_TOKENS = {
     "minimal": {
-        "bg": "FFFFFF", "title": "111111", "text": "333333",
-        "accent": "6366F1", "font_title": "Helvetica", "font_body": "Helvetica",
+        "bg": "F9F9F9", "bg2": None, "title": "1A1A1A", "text": "333333",
+        "accent": "1D4ED8", "muted": "9CA3AF", "on_accent": "FFFFFF",
+        "font_title": "Helvetica", "font_body": "Helvetica",
+        "mode": "light", "decoration": "none",
     },
     "academic": {
-        "bg": "F7F5F0", "title": "1F2937", "text": "374151",
-        "accent": "1D4ED8", "font_title": "Georgia", "font_body": "Georgia",
+        "bg": "FAF9F6", "bg2": None, "title": "1D3557", "text": "222222",
+        "accent": "1D3557", "muted": "6B7280", "on_accent": "FFFFFF",
+        "font_title": "Georgia", "font_body": "Georgia",
+        "mode": "light", "decoration": "rules",
     },
     "creative": {
-        "bg": "FDF2F8", "title": "831843", "text": "4B1D3F",
-        "accent": "EC4899", "font_title": "Verdana", "font_body": "Verdana",
+        "bg": "1B1030", "bg2": "6D1B7B", "title": "FFFFFF", "text": "F5E8FF",
+        "accent": "C6FF00", "muted": "D6BCFA", "on_accent": "111111",
+        "font_title": "Verdana", "font_body": "Verdana",
+        "mode": "dark", "decoration": "geometry",
     },
     "corporate": {
-        "bg": "0F172A", "title": "0F172A", "text": "1E293B",
-        "accent": "0EA5E9", "font_title": "Calibri", "font_body": "Calibri",
+        "bg": "FFFFFF", "bg2": None, "title": "0F172A", "text": "1E293B",
+        "accent": "0EA5E9", "muted": "64748B", "on_accent": "FFFFFF",
+        "font_title": "Calibri", "font_body": "Calibri",
+        "mode": "light", "decoration": "cards",
     },
     "dark": {
-        "bg": "0F0F14", "title": "FFFFFF", "text": "D1D5DB",
-        "accent": "8B5CF6", "font_title": "Helvetica", "font_body": "Helvetica",
+        "bg": "121212", "bg2": None, "title": "FFFFFF", "text": "E0E0E0",
+        "accent": "22D3EE", "muted": "9CA3AF", "on_accent": "111111",
+        "font_title": "Calibri", "font_body": "Calibri",
+        "mode": "dark", "decoration": "glow",
     },
 }
 
 
-def _hex_to_rgb(hex_color: str) -> RGBColor:
-    return RGBColor.from_string(hex_color.lstrip("#"))
+def _hex(color_hex: str) -> RGBColor:
+    return RGBColor.from_string(color_hex.lstrip("#"))
 
 
 def _set_shape_transparency(shape, alpha_percent: float):
-    """
-    Прозрачность заливки через прямую правку XML — единственный рабочий способ
-    в python-pptx (нет публичного API вроде shape.fill.transparency).
-    alpha_percent: 0.0 (полностью прозрачно) .. 1.0 (полностью непрозрачно)
-    """
+    """alpha_percent: 0.0 (прозрачно) .. 1.0 (непрозрачно). Нет публичного API в python-pptx."""
     sp = shape.fill.fore_color._xFill
     srgb = sp.find("{http://schemas.openxmlformats.org/drawingml/2006/main}srgbClr")
     if srgb is None:
         return
-    alpha_val = str(int(alpha_percent * 100000))
-    alpha_el = etree.SubElement(
-        srgb, "{http://schemas.openxmlformats.org/drawingml/2006/main}alpha"
-    )
-    alpha_el.set("val", alpha_val)
+    alpha_el = etree.SubElement(srgb, "{http://schemas.openxmlformats.org/drawingml/2006/main}alpha")
+    alpha_el.set("val", str(int(alpha_percent * 100000)))
 
 
 async def _download_image(url: str) -> Optional[bytes]:
@@ -84,22 +100,27 @@ async def _download_image(url: str) -> Optional[bytes]:
     return None
 
 
-def _add_gradient_background(slide, color1: str, color2: str, angle: float = 45.0):
+# ---------------------------------------------------------------------------
+# Базовые примитивы вёрстки
+# ---------------------------------------------------------------------------
+
+def _solid_bg(slide, color_hex):
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = _hex(color_hex)
+
+
+def _gradient_bg(slide, c1, c2, angle=45.0):
     fill = slide.background.fill
     fill.gradient()
     stops = fill.gradient_stops
-    stops[0].color.rgb = _hex_to_rgb(color1)
-    stops[1].color.rgb = _hex_to_rgb(color2)
+    stops[0].color.rgb = _hex(c1)
+    stops[1].color.rgb = _hex(c2)
     fill.gradient_angle = angle
 
 
-def _add_solid_background(slide, color_hex: str):
-    fill = slide.background.fill
-    fill.solid()
-    fill.fore_color.rgb = _hex_to_rgb(color_hex)
-
-
-def _add_title(slide, text, left, top, width, height, size, color, font, bold=True, align=PP_ALIGN.LEFT):
+def _text(slide, text, left, top, width, height, size, color, font, bold=False, italic=False,
+          align=PP_ALIGN.LEFT, line_spacing=1.15):
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
     tf.word_wrap = True
@@ -107,230 +128,362 @@ def _add_title(slide, text, left, top, width, height, size, color, font, bold=Tr
     p.text = text
     p.font.size = Pt(size)
     p.font.bold = bold
+    p.font.italic = italic
     p.font.name = font
-    p.font.color.rgb = _hex_to_rgb(color)
+    p.font.color.rgb = _hex(color)
     p.alignment = align
+    p.line_spacing = line_spacing
     return box
 
 
-def _add_bullets(slide, bullets, left, top, width, height, size, color, font, marker="•  "):
+def _multi_para(slide, lines, left, top, width, height, size, color, font, bold=False,
+                 marker="", space_after=10, align=PP_ALIGN.LEFT):
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
     tf.word_wrap = True
-    for i, bullet in enumerate(bullets):
+    for i, line in enumerate(lines):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.text = f"{marker}{bullet}"
+        p.text = f"{marker}{line}"
         p.font.size = Pt(size)
+        p.font.bold = bold
         p.font.name = font
-        p.font.color.rgb = _hex_to_rgb(color)
-        p.space_after = Pt(12)
+        p.font.color.rgb = _hex(color)
+        p.space_after = Pt(space_after)
+        p.alignment = align
     return box
 
 
-def _add_accent_bar(slide, left, top, width, height, color_hex):
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
-    bar.fill.solid()
-    bar.fill.fore_color.rgb = _hex_to_rgb(color_hex)
-    bar.line.fill.background()
-    return bar
+def _rect(slide, left, top, width, height, color_hex, transparency=None, line=False):
+    shp = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
+    shp.fill.solid()
+    shp.fill.fore_color.rgb = _hex(color_hex)
+    if transparency is not None:
+        _set_shape_transparency(shp, transparency)
+    if not line:
+        shp.line.fill.background()
+    return shp
 
 
-def _add_image_with_overlay(slide, image_bytes, overlay_top, overlay_height, overlay_alpha=0.4):
-    slide.shapes.add_picture(io.BytesIO(image_bytes), 0, 0, width=SLIDE_W, height=SLIDE_H)
-    overlay = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, overlay_top, SLIDE_W, overlay_height)
-    overlay.fill.solid()
-    overlay.fill.fore_color.rgb = _hex_to_rgb("000000")
-    overlay.line.fill.background()
-    _set_shape_transparency(overlay, overlay_alpha)
-    return overlay
+def _oval(slide, left, top, width, height, color_hex, transparency=None):
+    shp = slide.shapes.add_shape(MSO_SHAPE.OVAL, left, top, width, height)
+    shp.fill.solid()
+    shp.fill.fore_color.rgb = _hex(color_hex)
+    shp.line.fill.background()
+    if transparency is not None:
+        _set_shape_transparency(shp, transparency)
+    return shp
 
 
-def _render_minimal(slide, slide_data, preset, is_title, idx):
-    _add_solid_background(slide, preset["bg"])
-    if is_title:
-        _add_title(slide, slide_data["title"], Inches(1.0), Inches(3.0), Inches(11.3), Inches(1.3),
-                    44, preset["title"], preset["font_title"], align=PP_ALIGN.CENTER)
-        if slide_data.get("subtitle") or slide_data.get("bullets"):
-            sub = slide_data.get("subtitle") or slide_data["bullets"][0]
-            _add_title(slide, sub, Inches(1.5), Inches(4.3), Inches(10.3), Inches(0.8),
-                        18, preset["text"], preset["font_body"], bold=False, align=PP_ALIGN.CENTER)
-        return
-    _add_accent_bar(slide, Inches(0.7), Inches(0.75), Inches(0.5), Inches(0.08), preset["accent"])
-    _add_title(slide, slide_data["title"], Inches(0.7), Inches(0.95), Inches(11.9), Inches(1.1),
-                30, preset["title"], preset["font_title"])
-    if slide_data.get("bullets"):
-        _add_bullets(slide, slide_data["bullets"], Inches(0.7), Inches(2.3), Inches(11.9), Inches(4.5),
-                      18, preset["text"], preset["font_body"])
+def _image_cover(slide, image_bytes, left, top, width, height):
+    """Вставляет картинку с заполнением области без искажения пропорций (crop-to-fill)."""
+    pic = slide.shapes.add_picture(io.BytesIO(image_bytes), left, top, width=width, height=height)
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        iw, ih = img.size
+        box_ratio = width / height
+        img_ratio = iw / ih
+        if img_ratio > box_ratio:
+            crop = (1 - box_ratio / img_ratio) / 2
+            pic.crop_left = crop
+            pic.crop_right = crop
+        else:
+            crop = (1 - img_ratio / box_ratio) / 2
+            pic.crop_top = crop
+            pic.crop_bottom = crop
+    except Exception:
+        logger.warning("Не удалось вычислить пропорции картинки для crop-to-fill")
+    return pic
 
 
-def _render_academic(slide, slide_data, preset, is_title, idx):
-    _add_solid_background(slide, preset["bg"])
-    _add_accent_bar(slide, 0, 0, SLIDE_W, Inches(0.15), preset["accent"])
-    if is_title:
-        _add_title(slide, slide_data["title"], Inches(1.0), Inches(2.8), Inches(11.3), Inches(1.3),
-                    40, preset["title"], preset["font_title"], align=PP_ALIGN.CENTER)
-        sub = slide_data.get("subtitle") or (slide_data["bullets"][0] if slide_data.get("bullets") else "")
-        if sub:
-            _add_title(slide, sub, Inches(1.5), Inches(4.0), Inches(10.3), Inches(0.8),
-                        18, preset["text"], preset["font_body"], bold=False, align=PP_ALIGN.CENTER)
-        return
-    _add_title(slide, f"{idx:02d}", Inches(0.6), Inches(0.5), Inches(1.2), Inches(0.7),
-                20, preset["accent"], preset["font_title"])
-    _add_title(slide, slide_data["title"], Inches(1.6), Inches(0.5), Inches(10.9), Inches(1.0),
-                28, preset["title"], preset["font_title"])
-    if slide_data.get("bullets"):
-        _add_bullets(slide, slide_data["bullets"], Inches(1.6), Inches(1.8), Inches(11.0), Inches(4.8),
-                      17, preset["text"], preset["font_body"], marker="— ")
+def _image_or_placeholder(slide, image_bytes, left, top, width, height, tokens):
+    if image_bytes:
+        _image_cover(slide, image_bytes, left, top, width, height)
+    else:
+        accent2 = tokens.get("bg2") or tokens["accent"]
+        _gradient_bg  # noqa: touch to avoid unused import pruning by linters
+        shp = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
+        shp.fill.gradient()
+        stops = shp.fill.gradient_stops
+        stops[0].color.rgb = _hex(tokens["accent"])
+        stops[1].color.rgb = _hex(accent2)
+        shp.line.fill.background()
 
 
-def _render_creative(slide, slide_data, preset, is_title, idx):
-    _add_gradient_background(slide, preset["bg"], preset["accent"], angle=135.0 if idx % 2 else 45.0)
-    # декоративная геометрия
-    circle = slide.shapes.add_shape(MSO_SHAPE.OVAL, SLIDE_W - Inches(3.2), Inches(-1.2), Inches(4.2), Inches(4.2))
-    circle.fill.solid()
-    circle.fill.fore_color.rgb = _hex_to_rgb("FFFFFF")
-    circle.line.fill.background()
-    _set_shape_transparency(circle, 0.12)
+# ---------------------------------------------------------------------------
+# Фрейм стиля — фон + декор, вызывается для КАЖДОГО слайда до раскладки
+# ---------------------------------------------------------------------------
 
-    triangle = slide.shapes.add_shape(MSO_SHAPE.ISOCELES_TRIANGLE, Inches(-1.0), SLIDE_H - Inches(2.2), Inches(3.2), Inches(3.2))
-    triangle.rotation = 15
-    triangle.fill.solid()
-    triangle.fill.fore_color.rgb = _hex_to_rgb("FFFFFF")
-    triangle.line.fill.background()
-    _set_shape_transparency(triangle, 0.1)
+def draw_style_frame(slide, style: str, tokens: dict, idx: int, slide_count: int, is_title: bool):
+    if tokens["bg2"] and tokens["decoration"] == "geometry":
+        _gradient_bg(slide, tokens["bg"], tokens["bg2"], angle=45.0 if idx % 2 == 0 else 135.0)
+    else:
+        _solid_bg(slide, tokens["bg"])
 
-    title_color = "FFFFFF"
-    if is_title:
-        _add_title(slide, slide_data["title"], Inches(1.0), Inches(2.9), Inches(11.3), Inches(1.4),
-                    46, title_color, preset["font_title"], align=PP_ALIGN.CENTER)
-        sub = slide_data.get("subtitle") or (slide_data["bullets"][0] if slide_data.get("bullets") else "")
-        if sub:
-            _add_title(slide, sub, Inches(1.5), Inches(4.2), Inches(10.3), Inches(0.8),
-                        19, "F5D0E7", preset["font_body"], bold=False, align=PP_ALIGN.CENTER)
-        return
-    _add_title(slide, slide_data["title"], Inches(0.8), Inches(0.8), Inches(11.7), Inches(1.2),
-                32, title_color, preset["font_title"])
-    if slide_data.get("bullets"):
-        _add_bullets(slide, slide_data["bullets"], Inches(0.8), Inches(2.2), Inches(10.8), Inches(4.5),
-                      19, "FCE7F3", preset["font_body"], marker="◆  ")
+    deco = tokens["decoration"]
 
+    if deco == "rules":  # academic
+        _rect(slide, 0, 0, SLIDE_W, Pt(3), tokens["accent"])
+        if not is_title:
+            _text(slide, f"{idx + 1:02d} / {slide_count:02d}", SLIDE_W - Inches(1.4), SLIDE_H - Inches(0.45),
+                  Inches(1.1), Inches(0.35), 10, tokens["muted"], tokens["font_body"], align=PP_ALIGN.RIGHT)
+            _rect(slide, MARGIN, SLIDE_H - Inches(0.55), SLIDE_W - 2 * MARGIN, Pt(1), tokens["muted"])
 
-def _render_corporate(slide, slide_data, preset, is_title, idx):
-    _add_solid_background(slide, "FFFFFF")
-    sidebar_w = Inches(4.2)
-    sidebar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, sidebar_w, SLIDE_H)
-    sidebar.fill.solid()
-    sidebar.fill.fore_color.rgb = _hex_to_rgb("0F172A")
-    sidebar.line.fill.background()
-    _add_accent_bar(slide, 0, Inches(0.6), Inches(0.55), Inches(0.08), preset["accent"])
+    elif deco == "cards":  # corporate
+        _rect(slide, 0, 0, SLIDE_W, Inches(0.12), tokens["accent"])
+        if not is_title:
+            _text(slide, f"{idx + 1:02d}", SLIDE_W - Inches(1.0), SLIDE_H - Inches(0.5),
+                  Inches(0.7), Inches(0.35), 11, tokens["muted"], tokens["font_body"], align=PP_ALIGN.RIGHT)
 
-    if is_title:
-        _add_title(slide, slide_data["title"], Inches(0.5), Inches(2.7), sidebar_w - Inches(1.0), Inches(2.0),
-                    32, "FFFFFF", preset["font_title"])
-        sub = slide_data.get("subtitle") or (slide_data["bullets"][0] if slide_data.get("bullets") else "")
-        if sub:
-            _add_title(slide, sub, Inches(0.5), Inches(4.5), sidebar_w - Inches(1.0), Inches(1.5),
-                        15, "94A3B8", preset["font_body"], bold=False)
-        return
+    elif deco == "geometry":  # creative
+        c = _oval(slide, SLIDE_W - Inches(3.0), Inches(-1.4), Inches(4.2), Inches(4.2), "FFFFFF", 0.10)
+        t = slide.shapes.add_shape(MSO_SHAPE.ISOSCELES_TRIANGLE, Inches(-1.1), SLIDE_H - Inches(2.0),
+                                    Inches(3.0), Inches(3.0))
+        t.rotation = 12
+        t.fill.solid()
+        t.fill.fore_color.rgb = _hex(tokens["accent"])
+        t.line.fill.background()
+        _set_shape_transparency(t, 0.18)
 
-    _add_title(slide, f"{idx:02d}", Inches(0.5), Inches(0.5), Inches(2.0), Inches(0.6),
-                16, preset["accent"], preset["font_title"])
-    _add_title(slide, slide_data["title"], Inches(0.5), Inches(1.1), sidebar_w - Inches(1.0), Inches(2.2),
-                24, "FFFFFF", preset["font_title"])
-    if slide_data.get("bullets"):
-        _add_bullets(slide, slide_data["bullets"], sidebar_w + Inches(0.6), Inches(0.9), Inches(8.0), Inches(5.5),
-                      18, "1E293B", preset["font_body"])
+    elif deco == "glow":  # dark
+        glow = _oval(slide, SLIDE_W - Inches(2.6), Inches(-1.8), Inches(4.0), Inches(4.0), tokens["accent"], 0.14)
 
 
-def _render_dark(slide, slide_data, preset, is_title, idx):
-    _add_solid_background(slide, preset["bg"])
-    if is_title:
-        _add_title(slide, slide_data["title"], Inches(1.0), Inches(3.0), Inches(11.3), Inches(1.3),
-                    44, "FFFFFF", preset["font_title"], align=PP_ALIGN.CENTER)
-        sub = slide_data.get("subtitle") or (slide_data["bullets"][0] if slide_data.get("bullets") else "")
-        if sub:
-            _add_title(slide, sub, Inches(1.5), Inches(4.3), Inches(10.3), Inches(0.8),
-                        18, "9CA3AF", preset["font_body"], bold=False, align=PP_ALIGN.CENTER)
-        return
-    _add_accent_bar(slide, Inches(0.7), Inches(0.8), Inches(0.5), Inches(0.08), preset["accent"])
-    _add_title(slide, slide_data["title"], Inches(0.7), Inches(1.0), Inches(11.9), Inches(1.1),
-                30, "FFFFFF", preset["font_title"])
-    if slide_data.get("bullets"):
-        _add_bullets(slide, slide_data["bullets"], Inches(0.7), Inches(2.3), Inches(11.9), Inches(4.5),
-                      18, preset["text"] if preset["text"] != "1E293B" else "D1D5DB", preset["font_body"])
+def _content_top(tokens) -> Inches:
+    if tokens["decoration"] == "rules":
+        return Inches(1.05)
+    if tokens["decoration"] == "cards":
+        return Inches(1.0)
+    return Inches(0.9)
 
 
-STYLE_RENDERERS = {
-    "minimal": _render_minimal,
-    "academic": _render_academic,
-    "creative": _render_creative,
-    "corporate": _render_corporate,
-    "dark": _render_dark,
+def _content_bottom(tokens) -> Inches:
+    if tokens["decoration"] == "rules":
+        return SLIDE_H - Inches(0.75)
+    return SLIDE_H - Inches(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Раскладки
+# ---------------------------------------------------------------------------
+
+def _render_title(slide, data, tokens, image_bytes):
+    _text(slide, data.get("title", ""), Inches(1.0), Inches(2.9), SLIDE_W - Inches(2.0), Inches(1.5),
+          44, tokens["title"], tokens["font_title"], bold=True, align=PP_ALIGN.CENTER)
+    subtitle = data.get("subtitle")
+    if subtitle:
+        _text(slide, subtitle, Inches(1.8), Inches(4.3), SLIDE_W - Inches(3.6), Inches(0.9),
+              18, tokens["text"], tokens["font_body"], align=PP_ALIGN.CENTER)
+
+
+def _render_toc(slide, data, tokens, image_bytes):
+    top = _content_top(tokens)
+    _text(slide, data.get("title", "Оглавление"), MARGIN, top, SLIDE_W - 2 * MARGIN, Inches(0.9),
+          30, tokens["title"], tokens["font_title"], bold=True)
+    items = data.get("items") or []
+    y = top + Inches(1.1)
+    row_h = Inches(0.62)
+    for i, item in enumerate(items):
+        _text(slide, f"{i + 1:02d}", MARGIN, y, Inches(0.7), row_h, 18, tokens["accent"], tokens["font_title"], bold=True)
+        _text(slide, item, MARGIN + Inches(0.9), y, SLIDE_W - 2 * MARGIN - Inches(0.9), row_h,
+              16, tokens["text"], tokens["font_body"])
+        y += row_h
+
+
+def _render_thesis_proof(slide, data, tokens, image_bytes):
+    top = _content_top(tokens)
+    left_w = Inches(5.7)
+    _text(slide, data.get("claim", data.get("title", "")), MARGIN, top, left_w, Inches(2.0),
+          26, tokens["title"], tokens["font_title"], bold=True, line_spacing=1.2)
+    facts = data.get("facts") or []
+    _multi_para(slide, facts, MARGIN, top + Inches(2.1), left_w, _content_bottom(tokens) - (top + Inches(2.1)),
+                16, tokens["text"], tokens["font_body"], marker="—  ", space_after=12)
+    img_left = MARGIN + left_w + Inches(0.4)
+    img_w = SLIDE_W - MARGIN - img_left
+    _image_or_placeholder(slide, image_bytes, img_left, top, img_w, _content_bottom(tokens) - top, tokens)
+
+
+def _render_dense_text(slide, data, tokens, image_bytes):
+    top = _content_top(tokens)
+    _text(slide, data.get("problem", data.get("title", "")), MARGIN, top, SLIDE_W - 2 * MARGIN, Inches(1.0),
+          26, tokens["title"], tokens["font_title"], bold=True)
+    body_top = top + Inches(1.15)
+    body_bottom = _content_bottom(tokens)
+    paragraph = data.get("paragraph", "")
+    if image_bytes:
+        text_w = Inches(7.2)
+        _text(slide, paragraph, MARGIN, body_top, text_w, body_bottom - body_top,
+              15, tokens["text"], tokens["font_body"], line_spacing=1.3)
+        img_left = MARGIN + text_w + Inches(0.4)
+        img_w = SLIDE_W - MARGIN - img_left
+        _image_or_placeholder(slide, image_bytes, img_left, body_top, img_w, body_bottom - body_top, tokens)
+    else:
+        _text(slide, paragraph, MARGIN, body_top, SLIDE_W - 2 * MARGIN, body_bottom - body_top,
+              16, tokens["text"], tokens["font_body"], line_spacing=1.35)
+
+
+def _render_concept_anatomy(slide, data, tokens, image_bytes):
+    top = _content_top(tokens)
+    left_w = Inches(5.9)
+    _text(slide, data.get("term", data.get("title", "")), MARGIN, top, left_w, Inches(0.6),
+          22, tokens["title"], tokens["font_title"], bold=True)
+    _text(slide, data.get("definition", ""), MARGIN, top + Inches(0.65), left_w, Inches(1.7),
+          15, tokens["text"], tokens["font_body"], line_spacing=1.25)
+
+    parts = data.get("parts") or []
+    py = top + Inches(2.5)
+    for part in parts:
+        name = part.get("name", "") if isinstance(part, dict) else str(part)
+        func = part.get("function", "") if isinstance(part, dict) else ""
+        _text(slide, name, MARGIN, py, left_w, Inches(0.3), 14, tokens["accent"], tokens["font_body"], bold=True)
+        _text(slide, func, MARGIN, py + Inches(0.3), left_w, Inches(0.4), 13, tokens["text"], tokens["font_body"])
+        py += Inches(0.75)
+
+    img_left = MARGIN + left_w + Inches(0.4)
+    img_w = SLIDE_W - MARGIN - img_left
+    _image_or_placeholder(slide, image_bytes, img_left, top, img_w, _content_bottom(tokens) - top, tokens)
+
+
+def _render_comparison(slide, data, tokens, image_bytes):
+    top = _content_top(tokens)
+    _text(slide, data.get("summary", data.get("title", "")), MARGIN, top, SLIDE_W - 2 * MARGIN, Inches(0.9),
+          24, tokens["title"], tokens["font_title"], bold=True)
+
+    cols_top = top + Inches(1.0)
+    img_h = Inches(1.5) if image_bytes else Inches(0)
+    if image_bytes:
+        _image_or_placeholder(slide, image_bytes, MARGIN, cols_top, SLIDE_W - 2 * MARGIN, img_h, tokens)
+        cols_top += img_h + Inches(0.25)
+
+    col_w = (SLIDE_W - 2 * MARGIN - Inches(0.6)) / 2
+    right_left = MARGIN + col_w + Inches(0.6)
+    bottom = _content_bottom(tokens)
+
+    _text(slide, data.get("left_label", ""), MARGIN, cols_top, col_w, Inches(0.4),
+          17, tokens["accent"], tokens["font_title"], bold=True)
+    _multi_para(slide, data.get("left_points") or [], MARGIN, cols_top + Inches(0.45), col_w, bottom - cols_top - Inches(0.45),
+                14, tokens["text"], tokens["font_body"], marker="•  ", space_after=8)
+
+    _rect(slide, MARGIN + col_w + Inches(0.28), cols_top, Pt(1.5), bottom - cols_top, tokens["muted"])
+
+    _text(slide, data.get("right_label", ""), right_left, cols_top, col_w, Inches(0.4),
+          17, tokens["accent"], tokens["font_title"], bold=True)
+    _multi_para(slide, data.get("right_points") or [], right_left, cols_top + Inches(0.45), col_w, bottom - cols_top - Inches(0.45),
+                14, tokens["text"], tokens["font_body"], marker="•  ", space_after=8)
+
+
+def _render_causal_chain(slide, data, tokens, image_bytes):
+    top = _content_top(tokens)
+    _text(slide, data.get("process_title", data.get("title", "")), MARGIN, top, SLIDE_W - 2 * MARGIN, Inches(0.9),
+          24, tokens["title"], tokens["font_title"], bold=True)
+
+    row_top = top + Inches(1.1)
+    box_w = Inches(3.5)
+    gap = Inches(0.55)
+    labels = [("Причина", data.get("cause", "")), ("Механизм", data.get("mechanism", "")), ("Итог", data.get("effect", ""))]
+    x = MARGIN
+    row_h = Inches(2.6) if not image_bytes else Inches(2.1)
+    for i, (label, text) in enumerate(labels):
+        card = _rect(slide, x, row_top, box_w, row_h, tokens.get("bg2") or tokens["bg"])
+        if tokens["mode"] == "light":
+            card.fill.fore_color.rgb = _hex("FFFFFF" if tokens["decoration"] != "rules" else tokens["bg"])
+            card.line.fill.solid()
+            card.line.color.rgb = _hex(tokens["muted"])
+            card.line.width = Pt(0.75)
+        _text(slide, label.upper(), x + Inches(0.2), row_top + Inches(0.15), box_w - Inches(0.4), Inches(0.35),
+              12, tokens["accent"], tokens["font_title"], bold=True)
+        _text(slide, text, x + Inches(0.2), row_top + Inches(0.55), box_w - Inches(0.4), row_h - Inches(0.75),
+              13, tokens["text"], tokens["font_body"], line_spacing=1.2)
+        x += box_w + gap
+        if i < 2:
+            _text(slide, "\u2192", x - gap + Inches(0.05), row_top + row_h / 2 - Inches(0.25), gap - Inches(0.1),
+                  Inches(0.5), 22, tokens["accent"], tokens["font_title"], bold=True, align=PP_ALIGN.CENTER)
+
+    if image_bytes:
+        img_top = row_top + row_h + Inches(0.3)
+        _image_or_placeholder(slide, image_bytes, MARGIN, img_top, SLIDE_W - 2 * MARGIN,
+                               _content_bottom(tokens) - img_top, tokens)
+
+
+def _render_quote_context(slide, data, tokens, image_bytes):
+    top = _content_top(tokens)
+    bottom = _content_bottom(tokens)
+    img_w = Inches(4.6)
+    _image_or_placeholder(slide, image_bytes, MARGIN, top, img_w, bottom - top, tokens)
+
+    text_left = MARGIN + img_w + Inches(0.5)
+    text_w = SLIDE_W - MARGIN - text_left
+
+    context = data.get("context", "")
+    quote = data.get("quote", "")
+    explanation = data.get("explanation", "")
+
+    _text(slide, context, text_left, top, text_w, Inches(0.8),
+          14, tokens["muted"], tokens["font_body"], italic=True)
+    _text(slide, f"\u00AB{quote}\u00BB", text_left, top + Inches(0.85), text_w, Inches(1.8),
+          22, tokens["title"], tokens["font_title"], bold=True, line_spacing=1.2)
+    _text(slide, explanation, text_left, top + Inches(2.9), text_w, bottom - (top + Inches(2.9)),
+          14, tokens["text"], tokens["font_body"], line_spacing=1.3)
+
+
+def _render_conclusion(slide, data, tokens, image_bytes):
+    _text(slide, data.get("title", ""), Inches(1.2), Inches(1.6), SLIDE_W - Inches(2.4), Inches(1.0),
+          32, tokens["title"], tokens["font_title"], bold=True, align=PP_ALIGN.CENTER)
+    bullets = data.get("bullets") or []
+    _multi_para(slide, bullets, Inches(2.2), Inches(3.0), SLIDE_W - Inches(4.4), Inches(3.5),
+                17, tokens["text"], tokens["font_body"], marker="\u2713  ", space_after=14, align=PP_ALIGN.LEFT)
+
+
+LAYOUT_RENDERERS = {
+    "title": _render_title,
+    "toc": _render_toc,
+    "thesis_proof": _render_thesis_proof,
+    "dense_text": _render_dense_text,
+    "concept_anatomy": _render_concept_anatomy,
+    "comparison": _render_comparison,
+    "causal_chain": _render_causal_chain,
+    "quote_context": _render_quote_context,
+    "conclusion": _render_conclusion,
 }
 
 
-async def build_pptx(
-    title: str,
-    slides: List[dict],
-    style: str = "minimal",
-    language: str = "ru",
-) -> bytes:
+async def build_pptx(title: str, slides: List[dict], style: str = "minimal", language: str = "ru") -> bytes:
     """
-    slides: список dict вида
-        {"title": str, "subtitle": Optional[str], "bullets": [str],
-         "image_url": Optional[str], "notes": Optional[str]}
-    Возвращает bytes готового .pptx файла.
+    slides: список dict с обязательным ключом "layout" и полями под эту раскладку
+    (см. generators.LAYOUT_SCHEMAS), плюс "image_url" и "notes".
     """
-    preset = STYLE_PRESETS.get(style, STYLE_PRESETS["minimal"])
-    renderer = STYLE_RENDERERS.get(style, _render_minimal)
+    tokens = STYLE_TOKENS.get(style, STYLE_TOKENS["minimal"])
 
     prs = Presentation()
     prs.slide_width = SLIDE_W
     prs.slide_height = SLIDE_H
     blank_layout = prs.slide_layouts[6]
+    slide_count = len(slides)
 
     for idx, slide_data in enumerate(slides):
         slide = prs.slides.add_slide(blank_layout)
-        is_title_slide = idx == 0
+        layout = slide_data.get("layout", "thesis_proof")
+        is_title_slide = layout == "title"
 
-        # Фоновое изображение — только для "не-титульных" слайдов с картинкой,
-        # чтобы стиль-специфичная вёрстка (сайдбар, геометрия) не терялась.
+        draw_style_frame(slide, style, tokens, idx, slide_count, is_title_slide)
+
         image_bytes = None
-        use_full_bg_image = style in ("minimal", "dark") and slide_data.get("image_url") and not is_title_slide
-        if use_full_bg_image:
+        if slide_data.get("image_url"):
             image_bytes = await _download_image(slide_data["image_url"])
 
+        renderer = LAYOUT_RENDERERS.get(layout, _render_thesis_proof)
         try:
-            if image_bytes:
-                _add_image_with_overlay(slide, image_bytes, Inches(4.4), Inches(3.1), overlay_alpha=0.55)
-                # Текст поверх фото рисуем отдельно (светлый), а не через renderer с preset-цветами
-                _add_title(slide, slide_data["title"], Inches(0.7), Inches(4.6), Inches(11.9), Inches(1.1),
-                            30, "FFFFFF", preset["font_title"])
-                if slide_data.get("bullets"):
-                    _add_bullets(slide, slide_data["bullets"][:3], Inches(0.7), Inches(5.7), Inches(11.9), Inches(1.6),
-                                  16, "F3F4F6", preset["font_body"])
-            else:
-                renderer(slide, slide_data, preset, is_title_slide, idx)
+            renderer(slide, slide_data, tokens, image_bytes)
         except Exception:
-            logger.exception("Ошибка рендера слайда %d стилем %s — рисуем безопасный fallback", idx, style)
-            _add_solid_background(slide, preset["bg"])
-            _add_title(slide, slide_data.get("title", ""), Inches(0.7), Inches(0.8), Inches(11.9), Inches(1.1),
-                        28, preset["title"], preset["font_title"])
-            if slide_data.get("bullets"):
-                _add_bullets(slide, slide_data["bullets"], Inches(0.7), Inches(2.1), Inches(11.9), Inches(4.5),
-                              18, preset["text"], preset["font_body"])
+            logger.exception("Ошибка рендера слайда %d (layout=%s, style=%s) — safe fallback", idx, layout, style)
+            _text(slide, slide_data.get("title", ""), MARGIN, Inches(0.9), SLIDE_W - 2 * MARGIN, Inches(1.0),
+                  26, tokens["title"], tokens["font_title"], bold=True)
+            fallback_lines = slide_data.get("facts") or slide_data.get("bullets") or slide_data.get("items") or []
+            if fallback_lines:
+                _multi_para(slide, fallback_lines, MARGIN, Inches(2.1), SLIDE_W - 2 * MARGIN, Inches(4.5),
+                            16, tokens["text"], tokens["font_body"], marker="•  ")
 
         if slide_data.get("notes"):
             slide.notes_slide.notes_text_frame.text = slide_data["notes"]
-
-        if not is_title_slide:
-            num_box = slide.shapes.add_textbox(SLIDE_W - Inches(1.0), SLIDE_H - Inches(0.5), Inches(0.8), Inches(0.4))
-            np_ = num_box.text_frame.paragraphs[0]
-            np_.text = str(idx + 1)
-            np_.font.size = Pt(11)
-            np_.font.color.rgb = _hex_to_rgb(
-                "94A3B8" if style in ("dark", "corporate") else "9CA3AF"
-            )
 
     buffer = io.BytesIO()
     prs.save(buffer)
