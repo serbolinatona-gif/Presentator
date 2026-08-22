@@ -1,30 +1,34 @@
 """
 image_fetcher.py
-Подбор изображений через Picsum Photos (picsum.photos) — бесплатный сервис
-случайных стоковых фото БЕЗ ключа и БЕЗ регистрации. Работает из любой страны.
+Подбор тематических изображений.
 
-Компромисс: в отличие от Pexels, Picsum не умеет искать по ключевым словам —
-он просто отдаёт случайное фото по "seed" (детерминированному идентификатору).
-Чтобы картинки хотя бы не дублировались бессмысленно и было что-то похожее на
-привязку к теме слайда, в качестве seed используются ключевые слова слайда:
-один и тот же набор ключевых слов всегда даёт одно и то же фото.
+Основной источник — Pixabay API (бесплатный, поиск по ключевым словам, обычно
+регистрируется проще, чем Pexels/Unsplash — https://pixabay.com/api/docs/).
+Если PIXABAY_API_KEY не задан или запрос не удался — используется Picsum Photos
+(без ключа, но БЕЗ поиска по смыслу, только детерминированная случайная картинка).
 
-Если понадобится подбор именно по смыслу (а не просто симпатичная случайная
-картинка) — можно позже подключить Pixabay API (тоже бесплатный, часто
-регистрируется проще, чем Pexels) без изменений в остальном коде: контракт
-fetch_image_url(keywords) -> Optional[str] остаётся прежним.
+Про Яндекс: у Яндекса нет открытого бесплатного API поиска изображений по ключевым
+словам для такого сценария (старый XML-поиск закрыт для новых коммерческих кейсов),
+поэтому эта интеграция технически недоступна без платного корпоративного доступа.
+
+Контракт функции не меняется: fetch_image_url(keywords) -> Optional[str].
 """
 
 import hashlib
 import logging
+import os
 import random
 from typing import List, Optional
 
+import httpx
+
 logger = logging.getLogger("slideforge.image_fetcher")
+
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+PIXABAY_URL = "https://pixabay.com/api/"
 
 PICSUM_BASE = "https://picsum.photos"
 
-# Пары цветов для градиентной заглушки, если картинку решили не использовать
 FALLBACK_GRADIENTS = [
     ("#6366f1", "#8b5cf6"),
     ("#0ea5e9", "#22d3ee"),
@@ -40,18 +44,60 @@ def random_gradient() -> tuple:
 
 
 def _seed_from_keywords(keywords: List[str]) -> str:
-    joined = "-".join(keywords) or "slideforge"
-    # короткий стабильный хэш, чтобы seed был компактным и URL-safe
+    joined = "-".join(keywords) or "presentator"
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:12]
+
+
+async def _fetch_from_pixabay(keywords: List[str]) -> Optional[str]:
+    if not PIXABAY_API_KEY or not keywords:
+        return None
+
+    query = " ".join(keywords[:3])
+    params = {
+        "key": PIXABAY_API_KEY,
+        "q": query,
+        "image_type": "photo",
+        "orientation": "horizontal",
+        "safesearch": "true",
+        "per_page": 6,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(PIXABAY_URL, params=params)
+    except httpx.RequestError as exc:
+        logger.warning("Pixabay недоступен: %s", exc)
+        return None
+
+    if resp.status_code == 429:
+        logger.warning("Превышен лимит Pixabay API.")
+        return None
+    if resp.status_code != 200:
+        logger.warning("Pixabay вернул %s для запроса '%s'", resp.status_code, query)
+        return None
+
+    data = resp.json()
+    hits = data.get("hits", [])
+    if not hits:
+        return None
+
+    photo = random.choice(hits[: min(3, len(hits))])
+    return photo.get("largeImageURL") or photo.get("webformatURL")
+
+
+def _picsum_fallback_url(keywords: List[str]) -> Optional[str]:
+    if not keywords:
+        return None
+    seed = _seed_from_keywords(keywords)
+    return f"{PICSUM_BASE}/seed/{seed}/1600/1000"
 
 
 async def fetch_image_url(keywords: List[str]) -> Optional[str]:
     """
-    Возвращает URL изображения 1920x1080 с Picsum, детерминированный по ключевым словам.
-    Не делает сетевых запросов сама — Picsum отдаёт картинку напрямую по URL,
-    поэтому здесь просто конструируется прямая ссылка.
+    Возвращает URL тематического изображения. Пытается Pixabay (по смыслу),
+    при неудаче — Picsum (без поиска по смыслу, но всегда доступен без ключа).
     """
-    if not keywords:
-        return None
-    seed = _seed_from_keywords(keywords)
-    return f"{PICSUM_BASE}/seed/{seed}/1920/1080"
+    pixabay_url = await _fetch_from_pixabay(keywords)
+    if pixabay_url:
+        return pixabay_url
+    return _picsum_fallback_url(keywords)
