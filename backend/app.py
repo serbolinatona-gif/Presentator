@@ -22,7 +22,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from nanoid import generate as nanoid_generate
 from pydantic import BaseModel, Field, field_validator
 
-from generators import GenerationError, generate_outline, generate_slide_content
+from generators import (
+    GenerationError,
+    LAYOUTS_WITH_IMAGE,
+    assign_layouts,
+    generate_layout_content,
+    generate_outline,
+)
 from image_fetcher import fetch_image_url
 from pptx_builder import build_pptx
 from slidev_builder import build_html_preview
@@ -90,8 +96,11 @@ async def _generation_stream(req: GenerateRequest):
             {"slides": [{"title": o.title, "key_points": o.key_points} for o in outline]},
         )
 
+        layouts = assign_layouts(req.slide_count)
+
         slides_data = []
         for i, item in enumerate(outline):
+            layout = layouts[i]
             yield sse_event(
                 "status",
                 {
@@ -100,26 +109,25 @@ async def _generation_stream(req: GenerateRequest):
                     "progress": round(((i) / len(outline)) * 70 + 10, 1),
                 },
             )
-            content = await generate_slide_content(
-                req.topic, item, req.style, req.language, req.with_notes, req.detailed_prompt
+            content = await generate_layout_content(
+                req.topic, item, layout, req.style, req.language, req.with_notes, req.detailed_prompt
             )
-            image_url = await fetch_image_url(content.image_keywords)
 
-            slide_dict = {
-                "title": content.title,
-                "subtitle": content.subtitle,
-                "bullets": content.bullets,
-                "image_url": image_url,
-                "notes": content.speaker_notes,
-            }
+            image_url = None
+            if layout in LAYOUTS_WITH_IMAGE:
+                image_url = await fetch_image_url(content.get("image_keywords") or [])
+
+            slide_dict = dict(content)
+            slide_dict["image_url"] = image_url
+            slide_dict["notes"] = content.get("speaker_notes")
             slides_data.append(slide_dict)
 
             yield sse_event(
                 "slide",
                 {
                     "index": i,
-                    "title": content.title,
-                    "bullets": content.bullets,
+                    "layout": layout,
+                    "title": content.get("title"),
                     "image_url": image_url,
                 },
             )
