@@ -20,6 +20,7 @@ shapes с точными координатами и на практике вы�
 
 import io
 import logging
+import re
 from typing import List, Optional
 
 import httpx
@@ -28,7 +29,7 @@ from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Inches, Pt
 
 logger = logging.getLogger("slideforge.pptx_builder")
@@ -55,10 +56,11 @@ STYLE_TOKENS = {
         "mode": "light", "decoration": "rules",
     },
     "creative": {
-        "bg": "1B1030", "bg2": "6D1B7B", "title": "FFFFFF", "text": "F5E8FF",
-        "accent": "C6FF00", "muted": "D6BCFA", "on_accent": "111111",
+        "bg": "FFFFFF", "bg2": None, "title": "18122B", "text": "3D3355",
+        "accent": "6C5CE7", "muted": "9B93B8", "on_accent": "FFFFFF",
         "font_title": "Verdana", "font_body": "Verdana",
-        "mode": "dark", "decoration": "geometry",
+        "mode": "light", "decoration": "geometry",
+        "palette": ["FF6B6B", "4ECDC4", "FFD93D", "6C5CE7", "1DD3B0", "FF9F43", "3AB0FF", "F368E0"],
     },
     "corporate": {
         "bg": "FFFFFF", "bg2": None, "title": "0F172A", "text": "1E293B",
@@ -73,6 +75,22 @@ STYLE_TOKENS = {
         "mode": "dark", "decoration": "glow",
     },
 }
+
+
+def _clean_text(text) -> str:
+    """
+    Страховка от типографских багов в тексте от AI:
+    - схлопывает переносы строк/лишние пробелы в один пробел (чтобы не было
+      "склеенных" абзацев без пробела при копировании/повторной генерации)
+    - делает первую букву предложения заглавной, если модель вернула её строчной
+    """
+    if not text:
+        return ""
+    s = str(text).replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    if s and s[0].isalpha() and s[0].islower():
+        s = s[0].upper() + s[1:]
+    return s
 
 
 def _hex(color_hex: str) -> RGBColor:
@@ -124,8 +142,9 @@ def _text(slide, text, left, top, width, height, size, color, font, bold=False, 
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
     tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE  # шрифт сжимается, если текст не влезает в рамку
     p = tf.paragraphs[0]
-    p.text = text
+    p.text = _clean_text(text)
     p.font.size = Pt(size)
     p.font.bold = bold
     p.font.italic = italic
@@ -138,12 +157,15 @@ def _text(slide, text, left, top, width, height, size, color, font, bold=False, 
 
 def _multi_para(slide, lines, left, top, width, height, size, color, font, bold=False,
                  marker="", space_after=10, align=PP_ALIGN.LEFT):
+    if isinstance(lines, str):
+        lines = [lines]  # защита: если AI вернул строку вместо списка, не разбиваем по буквам
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
     tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     for i, line in enumerate(lines):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.text = f"{marker}{line}"
+        p.text = f"{marker}{_clean_text(line)}"
         p.font.size = Pt(size)
         p.font.bold = bold
         p.font.name = font
@@ -234,15 +256,35 @@ def draw_style_frame(slide, style: str, tokens: dict, idx: int, slide_count: int
             _text(slide, f"{idx + 1:02d}", SLIDE_W - Inches(1.0), SLIDE_H - Inches(0.5),
                   Inches(0.7), Inches(0.35), 11, tokens["muted"], tokens["font_body"], align=PP_ALIGN.RIGHT)
 
-    elif deco == "geometry":  # creative
-        c = _oval(slide, SLIDE_W - Inches(3.0), Inches(-1.4), Inches(4.2), Inches(4.2), "FFFFFF", 0.10)
-        t = slide.shapes.add_shape(MSO_SHAPE.ISOSCELES_TRIANGLE, Inches(-1.1), SLIDE_H - Inches(2.0),
-                                    Inches(3.0), Inches(3.0))
-        t.rotation = 12
-        t.fill.solid()
-        t.fill.fore_color.rgb = _hex(tokens["accent"])
-        t.line.fill.background()
-        _set_shape_transparency(t, 0.18)
+    elif deco == "geometry":  # creative — светлый фон + разноцветные фигуры (Figma-style)
+        palette = tokens.get("palette") or [tokens["accent"]]
+
+        def pcolor(offset):
+            return palette[(idx + offset) % len(palette)]
+
+        # верхний правый угол — крупный полупрозрачный круг
+        # верхний правый угол — крупный полупрозрачный круг
+        _oval(slide, SLIDE_W - Inches(2.6), Inches(-1.3), Inches(3.6), Inches(3.6), pcolor(0), 0.85)
+        # маленький акцентный круг
+        _oval(slide, SLIDE_W - Inches(1.5), Inches(1.6), Inches(0.9), Inches(0.9), pcolor(1), 0.9)
+        # скруглённый прямоугольник снизу слева
+        rrect = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(-0.6), SLIDE_H - Inches(1.4),
+                                        Inches(2.6), Inches(2.6))
+        rrect.rotation = 20
+        rrect.fill.solid()
+        rrect.fill.fore_color.rgb = _hex(pcolor(2))
+        rrect.line.fill.background()
+        _set_shape_transparency(rrect, 0.8)
+        # маленький треугольник-акцент
+        tri = slide.shapes.add_shape(MSO_SHAPE.ISOSCELES_TRIANGLE, Inches(0.3), SLIDE_H - Inches(0.9),
+                                      Inches(0.7), Inches(0.7))
+        tri.rotation = -15
+        tri.fill.solid()
+        tri.fill.fore_color.rgb = _hex(pcolor(3))
+        tri.line.fill.background()
+        # тонкая цветная плашка-акцент под заголовком (если не титульный)
+        if not is_title:
+            _rect(slide, MARGIN, Inches(0.78), Inches(0.55), Inches(0.1), pcolor(0))
 
     elif deco == "glow":  # dark
         glow = _oval(slide, SLIDE_W - Inches(2.6), Inches(-1.8), Inches(4.0), Inches(4.0), tokens["accent"], 0.14)
