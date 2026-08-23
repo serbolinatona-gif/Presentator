@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from typing import Dict, Optional
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -196,11 +197,23 @@ async def get_presentation_pptx(presentation_id: str):
     entry = PRESENTATIONS.get(presentation_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Презентация не найдена или истекло время хранения.")
-    filename = "".join(c for c in entry["title"][:40] if c.isalnum() or c in " -_").strip() or "presentation"
+
+    # HTTP-заголовки допускают только latin-1. Название презентации почти всегда
+    # на русском, поэтому raw filename="..." ломал скачивание (UnicodeEncodeError).
+    # Даём ASCII-фолбэк в filename= и полное имя (с кириллицей) через filename*=UTF-8''...
+    ascii_fallback = "".join(c for c in entry["title"][:40] if c.isascii() and (c.isalnum() or c in " -_")).strip()
+    ascii_fallback = ascii_fallback or "presentation"
+    utf8_name = quote(f'{entry["title"][:60].strip() or "presentation"}.pptx')
+
     return Response(
         content=entry["pptx"],
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        headers={"Content-Disposition": f'attachment; filename="{filename}.pptx"'},
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_fallback}.pptx"; '
+                f"filename*=UTF-8''{utf8_name}"
+            )
+        },
     )
 
 
