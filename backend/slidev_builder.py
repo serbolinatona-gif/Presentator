@@ -10,18 +10,41 @@ from typing import List
 STYLE_CSS = {
     "minimal": {"bg": "#F9F9F9", "title": "#1A1A1A", "text": "#333333", "accent": "#1D4ED8", "muted": "#9CA3AF", "font": "Helvetica, Arial, sans-serif"},
     "academic": {"bg": "#FAF9F6", "title": "#1D3557", "text": "#222222", "accent": "#1D3557", "muted": "#6B7280", "font": "Georgia, 'Times New Roman', serif"},
-    "creative": {"bg": "linear-gradient(135deg, #1B1030, #6D1B7B)", "title": "#FFFFFF", "text": "#F5E8FF", "accent": "#C6FF00", "muted": "#D6BCFA", "font": "Verdana, sans-serif"},
+    "creative": {"bg": "#FFFFFF", "title": "#18122B", "text": "#3D3355", "accent": "#6C5CE7", "muted": "#9B93B8", "font": "Verdana, sans-serif",
+                 "palette": ["#FF6B6B", "#4ECDC4", "#FFD93D", "#6C5CE7", "#1DD3B0", "#FF9F43", "#3AB0FF", "#F368E0"]},
     "corporate": {"bg": "#FFFFFF", "title": "#0F172A", "text": "#1E293B", "accent": "#0EA5E9", "muted": "#64748B", "font": "Calibri, Arial, sans-serif"},
     "dark": {"bg": "#121212", "title": "#FFFFFF", "text": "#E0E0E0", "accent": "#22D3EE", "muted": "#9CA3AF", "font": "Calibri, Arial, sans-serif"},
 }
 
 
+import re
+
+
+def _clean_text(text) -> str:
+    """Та же логика, что и в pptx_builder.py: схлопывание пробелов/переносов + капитализация."""
+    if not text:
+        return ""
+    s = str(text).replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    if s and s[0].isalpha() and s[0].islower():
+        s = s[0].upper() + s[1:]
+    return s
+
+
 def _esc(text) -> str:
     if text is None:
         return ""
+    text = _clean_text(text)
     return (
         str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     )
+
+
+def _as_list(value):
+    """Защита: если AI вернул строку вместо списка, не разбиваем её по буквам."""
+    if isinstance(value, str):
+        return [value] if value else []
+    return value or []
 
 
 def _img_tag(image_url, css_class="slide-img"):
@@ -120,15 +143,31 @@ def _render_body(layout: str, slide: dict, c: dict) -> str:
     return f'<h2>{_esc(slide.get("title"))}</h2>'
 
 
-def _render_slide(idx: int, slide: dict, c: dict) -> str:
+def _creative_decor(idx: int, c: dict) -> str:
+    """Разноцветные декоративные фигуры для креативного стиля (аналог pptx draw_style_frame)."""
+    palette = c.get("palette") or [c["accent"]]
+
+    def pcolor(offset):
+        return palette[(idx + offset) % len(palette)]
+
+    return f'''
+    <div class="creative-shape shape-circle-lg" style="background:{pcolor(0)}"></div>
+    <div class="creative-shape shape-circle-sm" style="background:{pcolor(1)}"></div>
+    <div class="creative-shape shape-square" style="background:{pcolor(2)}"></div>
+    <div class="creative-shape shape-triangle" style="border-bottom-color:{pcolor(3)}"></div>
+    '''
+
+
+def _render_slide(idx: int, slide: dict, c: dict, style: str) -> str:
     layout = slide.get("layout", "thesis_proof")
     body = _render_body(layout, slide, c)
-    return f'<section class="slide layout-{layout}"><div class="slide-inner">{body}</div></section>'
+    decor = _creative_decor(idx, c) if style == "creative" else ""
+    return f'<section class="slide layout-{layout}">{decor}<div class="slide-inner">{body}</div></section>'
 
 
 def build_html_preview(presentation_title: str, slides: List[dict], style: str = "minimal", language: str = "ru") -> str:
     c = STYLE_CSS.get(style, STYLE_CSS["minimal"])
-    slides_html = "".join(_render_slide(i, s, c) for i, s in enumerate(slides))
+    slides_html = "".join(_render_slide(i, s, c, style) for i, s in enumerate(slides))
     total = len(slides)
     nav_prev = "Назад" if language == "ru" else "Prev"
     nav_next = "Далее" if language == "ru" else "Next"
@@ -174,6 +213,16 @@ def build_html_preview(presentation_title: str, slides: List[dict], style: str =
   .quote {{ font-size: 1.4rem; font-weight: 800; color: {c['title']}; margin-bottom: 1rem; line-height: 1.3; }}
   .conclusion-list {{ max-width: 700px; margin: 1.5rem auto 0; }}
   .conclusion-list li {{ font-size: 1.15rem; margin-bottom: 0.9rem; }}
+  .creative-shape {{ position: absolute; border-radius: 50%; opacity: 0.85; z-index: 0; pointer-events: none; }}
+  .shape-circle-lg {{ width: 220px; height: 220px; top: -90px; right: -60px; opacity: 0.5; }}
+  .shape-circle-sm {{ width: 60px; height: 60px; top: 110px; right: 60px; }}
+  .shape-square {{ width: 130px; height: 130px; bottom: -50px; left: -40px; border-radius: 24px; transform: rotate(20deg); opacity: 0.55; }}
+  .shape-triangle {{
+    position: absolute; bottom: 40px; left: 30px; width: 0; height: 0;
+    border-left: 30px solid transparent; border-right: 30px solid transparent;
+    border-bottom: 52px solid; transform: rotate(-15deg); border-radius: 0;
+  }}
+  .slide-inner {{ position: relative; z-index: 1; }}
   .nav {{
     position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
     display: flex; gap: 10px; align-items: center;
@@ -214,6 +263,33 @@ def build_html_preview(presentation_title: str, slides: List[dict], style: str =
     if (dx > 50) document.getElementById('prevBtn').click();
     if (dx < -50) document.getElementById('nextBtn').click();
   }});
+
+  // Автоподгонка: если контент слайда не помещается по высоте — плавно уменьшаем
+  // шрифт всего слайда, пока не влезет (защита от переполнения на разных экранах).
+  function fitSlide(slide) {{
+    const inner = slide.querySelector('.slide-inner');
+    if (!inner) return;
+    let fontScale = 100;
+    let guard = 0;
+    while (inner.scrollHeight > slide.clientHeight && fontScale > 55 && guard < 20) {{
+      fontScale -= 5;
+      inner.style.fontSize = fontScale + '%';
+      guard++;
+    }}
+  }}
+  function fitAllSlides() {{
+    slides.forEach(s => {{
+      const wasActive = s.classList.contains('active');
+      s.classList.add('active');
+      s.style.visibility = 'hidden';
+      fitSlide(s);
+      s.style.visibility = '';
+      if (!wasActive) s.classList.remove('active');
+    }});
+  }}
+  window.addEventListener('load', fitAllSlides);
+  window.addEventListener('resize', fitAllSlides);
+
   show(0);
 </script>
 </body>
