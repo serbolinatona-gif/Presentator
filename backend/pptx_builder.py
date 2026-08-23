@@ -20,6 +20,7 @@ shapes с точными координатами и на практике вы�
 
 import io
 import logging
+import math
 import re
 from typing import List, Optional
 
@@ -93,8 +94,57 @@ def _clean_text(text) -> str:
     return s
 
 
+def _fit_font_size(char_count: int, base_size: int, width_in: float, height_in: float, min_size: int = 10) -> int:
+    """
+    Расчётное (не полагающееся на автоподгонку PowerPoint при открытии) уменьшение
+    размера шрифта, если текста больше, чем помещается в рамку. PowerPoint autofit
+    работает только при открытии файла и не везде одинаково (Google Slides/LibreOffice
+    иногда игнорируют флаг) — поэтому считаем сами, по приблизительной модели
+    "символов на строку" и "строк в высоту".
+    """
+    if char_count <= 0:
+        return base_size
+    avg_char_width_factor = 0.52  # эмпирический коэффициент средней ширины символа к кеглю
+    line_height_factor = 1.35
+    width_pt = width_in * 72
+    height_pt = height_in * 72
+    chars_per_line = max(1, width_pt / (base_size * avg_char_width_factor))
+    lines_needed = max(1, math.ceil(char_count / chars_per_line))
+    max_lines_fit = max(1, int(height_pt / (base_size * line_height_factor)))
+    if lines_needed <= max_lines_fit:
+        return base_size
+    scale = math.sqrt(max_lines_fit / lines_needed)
+    return max(min_size, int(base_size * scale))
+
+
+def _estimate_block_height_in(char_count: int, font_size: int, width_in: float, line_height_factor: float = 1.35) -> float:
+    """Оценка высоты (в дюймах), которую займёт текст такой длины при данном кегле и ширине."""
+    if char_count <= 0:
+        return 0.0
+    avg_char_width_factor = 0.52
+    width_pt = width_in * 72
+    chars_per_line = max(1, width_pt / (font_size * avg_char_width_factor))
+    lines = max(1, math.ceil(char_count / chars_per_line))
+    return (lines * font_size * line_height_factor) / 72
+
+
 def _hex(color_hex: str) -> RGBColor:
     return RGBColor.from_string(color_hex.lstrip("#"))
+
+
+EMU_PER_INCH = 914400
+
+
+def _to_inches(value) -> float:
+    """
+    Устойчиво конвертирует в дюймы. Length-объекты python-pptx (Inches/Pt/Emu) теряют
+    свой тип и становятся обычным int (EMU) после арифметики (например Inches(5) - Inches(1)
+    возвращает int, а не Length) — .inches у такого int уже не будет. Поэтому здесь
+    используем .inches, если он есть, иначе делим сырые EMU вручную.
+    """
+    if hasattr(value, "inches"):
+        return value.inches
+    return value / EMU_PER_INCH
 
 
 def _set_shape_transparency(shape, alpha_percent: float):
@@ -142,37 +192,46 @@ def _text(slide, text, left, top, width, height, size, color, font, bold=False, 
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
     tf.word_wrap = True
-    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE  # шрифт сжимается, если текст не влезает в рамку
+    tf.auto_size = MSO_AUTO_SIZE.NONE  # размер считаем сами — надёжнее автоподгонки PowerPoint,
+                                        # которую не все программы (Google Slides/LibreOffice) применяют одинаково
+    clean = _clean_text(text)
+    fitted_size = _fit_font_size(len(clean), size, _to_inches(width), _to_inches(height))
     p = tf.paragraphs[0]
-    p.text = _clean_text(text)
-    p.font.size = Pt(size)
+    p.text = clean
+    p.font.size = Pt(fitted_size)
     p.font.bold = bold
     p.font.italic = italic
     p.font.name = font
     p.font.color.rgb = _hex(color)
     p.alignment = align
     p.line_spacing = line_spacing
-    return box
+    box.text_frame.word_wrap = True
+    return box, _estimate_block_height_in(len(clean), fitted_size, _to_inches(width), line_spacing)
 
 
 def _multi_para(slide, lines, left, top, width, height, size, color, font, bold=False,
                  marker="", space_after=10, align=PP_ALIGN.LEFT):
     if isinstance(lines, str):
         lines = [lines]  # защита: если AI вернул строку вместо списка, не разбиваем по буквам
+    clean_lines = [f"{marker}{_clean_text(line)}" for line in lines]
+    total_chars = sum(len(l) for l in clean_lines)
+    fitted_size = _fit_font_size(total_chars, size, _to_inches(width), _to_inches(height))
+
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
     tf.word_wrap = True
-    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-    for i, line in enumerate(lines):
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    for i, line in enumerate(clean_lines):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.text = f"{marker}{_clean_text(line)}"
-        p.font.size = Pt(size)
+        p.text = line
+        p.font.size = Pt(fitted_size)
         p.font.bold = bold
         p.font.name = font
         p.font.color.rgb = _hex(color)
         p.space_after = Pt(space_after)
         p.alignment = align
-    return box
+    est_height = _estimate_block_height_in(total_chars, fitted_size, _to_inches(width)) + (len(clean_lines) * space_after / 72)
+    return box, est_height
 
 
 def _rect(slide, left, top, width, height, color_hex, transparency=None, line=False):
@@ -263,7 +322,6 @@ def draw_style_frame(slide, style: str, tokens: dict, idx: int, slide_count: int
             return palette[(idx + offset) % len(palette)]
 
         # верхний правый угол — крупный полупрозрачный круг
-        # верхний правый угол — крупный полупрозрачный круг
         _oval(slide, SLIDE_W - Inches(2.6), Inches(-1.3), Inches(3.6), Inches(3.6), pcolor(0), 0.85)
         # маленький акцентный круг
         _oval(slide, SLIDE_W - Inches(1.5), Inches(1.6), Inches(0.9), Inches(0.9), pcolor(1), 0.9)
@@ -334,10 +392,12 @@ def _render_toc(slide, data, tokens, image_bytes):
 def _render_thesis_proof(slide, data, tokens, image_bytes):
     top = _content_top(tokens)
     left_w = Inches(5.7)
-    _text(slide, data.get("claim", data.get("title", "")), MARGIN, top, left_w, Inches(2.0),
-          26, tokens["title"], tokens["font_title"], bold=True, line_spacing=1.2)
+    claim_box_h = Inches(2.0)
+    _, claim_used_h = _text(slide, data.get("claim", data.get("title", "")), MARGIN, top, left_w, claim_box_h,
+                             26, tokens["title"], tokens["font_title"], bold=True, line_spacing=1.2)
+    facts_top = top + Inches(max(claim_used_h + 0.25, 1.4))  # не ближе фиксированного минимума, но и не наезжаем
     facts = data.get("facts") or []
-    _multi_para(slide, facts, MARGIN, top + Inches(2.1), left_w, _content_bottom(tokens) - (top + Inches(2.1)),
+    _multi_para(slide, facts, MARGIN, facts_top, left_w, _content_bottom(tokens) - facts_top,
                 16, tokens["text"], tokens["font_body"], marker="—  ", space_after=12)
     img_left = MARGIN + left_w + Inches(0.4)
     img_w = SLIDE_W - MARGIN - img_left
@@ -368,11 +428,13 @@ def _render_concept_anatomy(slide, data, tokens, image_bytes):
     left_w = Inches(5.9)
     _text(slide, data.get("term", data.get("title", "")), MARGIN, top, left_w, Inches(0.6),
           22, tokens["title"], tokens["font_title"], bold=True)
-    _text(slide, data.get("definition", ""), MARGIN, top + Inches(0.65), left_w, Inches(1.7),
-          15, tokens["text"], tokens["font_body"], line_spacing=1.25)
+    def_top = top + Inches(0.65)
+    def_box_h = Inches(1.7)
+    _, def_used_h = _text(slide, data.get("definition", ""), MARGIN, def_top, left_w, def_box_h,
+                           15, tokens["text"], tokens["font_body"], line_spacing=1.25)
 
     parts = data.get("parts") or []
-    py = top + Inches(2.5)
+    py = def_top + Inches(max(def_used_h + 0.3, 1.0))
     for part in parts:
         name = part.get("name", "") if isinstance(part, dict) else str(part)
         func = part.get("function", "") if isinstance(part, dict) else ""
@@ -459,11 +521,15 @@ def _render_quote_context(slide, data, tokens, image_bytes):
     quote = data.get("quote", "")
     explanation = data.get("explanation", "")
 
-    _text(slide, context, text_left, top, text_w, Inches(0.8),
-          14, tokens["muted"], tokens["font_body"], italic=True)
-    _text(slide, f"\u00AB{quote}\u00BB", text_left, top + Inches(0.85), text_w, Inches(1.8),
-          22, tokens["title"], tokens["font_title"], bold=True, line_spacing=1.2)
-    _text(slide, explanation, text_left, top + Inches(2.9), text_w, bottom - (top + Inches(2.9)),
+    context_h = Inches(0.8)
+    _, context_used_h = _text(slide, context, text_left, top, text_w, context_h,
+                               14, tokens["muted"], tokens["font_body"], italic=True)
+    quote_top = top + Inches(max(context_used_h + 0.15, 0.6))
+    quote_h = Inches(1.8)
+    _, quote_used_h = _text(slide, f"\u00AB{quote}\u00BB", text_left, quote_top, text_w, quote_h,
+                             22, tokens["title"], tokens["font_title"], bold=True, line_spacing=1.2)
+    explanation_top = quote_top + Inches(max(quote_used_h + 0.2, 1.0))
+    _text(slide, explanation, text_left, explanation_top, text_w, bottom - explanation_top,
           14, tokens["text"], tokens["font_body"], line_spacing=1.3)
 
 
