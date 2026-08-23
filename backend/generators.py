@@ -44,7 +44,8 @@ GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completion
 GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "false").lower() == "true"
 
 MAX_RETRIES = 3
-OUTLINE_BATCH_SIZE = 5
+OUTLINE_BATCH_SIZE = 4  # уменьшено с 5: с более длинными промптами (анти-галлюцинации, грамотность)
+                        # батч из 5 слайдов иногда обрезался по лимиту токенов
 
 _token_cache = {"access_token": None, "expires_at": 0}
 
@@ -209,9 +210,10 @@ def _repair_json(text: str) -> str:
     - "умные" кавычки
     - висячие запятые
     - буквальные переносы строк внутри строк
-    - ГЛАВНОЕ: GigaChat периодически по ошибке экранирует СТРУКТУРНЫЕ кавычки
+    - GigaChat периодически по ошибке экранирует СТРУКТУРНЫЕ кавычки
       (разделители между элементами массива), например ["a\",\"b"] вместо ["a","b"].
-      Чиним множественным проходом регулярок рядом с , [ ] { } :
+    - GigaChat иногда забывает закрыть объект перед следующим в массиве:
+      ...],{"title":... вместо ...]},{"title":... — чиним и это.
     """
     fixed = text
     fixed = fixed.replace(""", '"').replace(""", '"').replace("'", "'")
@@ -219,6 +221,10 @@ def _repair_json(text: str) -> str:
     for _ in range(3):
         fixed = re.sub(r'\\"(\s*[,\]}:])', r'"\1', fixed)
         fixed = re.sub(r'([\[{,:]\s*)\\"', r'\1"', fixed)
+
+    # Пропущенная закрывающая } перед началом следующего объекта в массиве
+    fixed = re.sub(r"\]\s*,\s*\{", r"]},{", fixed)
+    fixed = re.sub(r'"\s*,\s*\{(?=\s*"title")', r'"},{', fixed)
 
     fixed = re.sub(r",\s*([\]}])", r"\1", fixed)
 
@@ -229,14 +235,38 @@ def _repair_json(text: str) -> str:
     return fixed
 
 
+def _balance_brackets(text: str) -> str:
+    """
+    Последний рубеж защиты: если ответ обрезался по лимиту токенов (max_tokens),
+    JSON останется незакрытым. Досчитываем непарные кавычки/скобки в конце,
+    чтобы получить хоть что-то валидное (даже если последний элемент неполный —
+    это лучше, чем полный отказ).
+    """
+    s = text
+    if s.count('"') % 2 == 1:
+        s += '"'
+    open_braces = s.count("{") - s.count("}")
+    open_brackets = s.count("[") - s.count("]")
+    if open_braces > 0:
+        s += "}" * open_braces
+    if open_brackets > 0:
+        s += "]" * open_brackets
+    return s
+
+
 def _parse_json_loose(raw_text: str) -> Optional[object]:
     candidate = _extract_json(raw_text)
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
         pass
+    repaired = _repair_json(candidate)
     try:
-        return json.loads(_repair_json(candidate))
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_balance_brackets(repaired))
     except json.JSONDecodeError:
         return None
 
@@ -373,7 +403,7 @@ async def generate_outline(
                 f"{error_note}"
             )
 
-        items = await _call_gigachat_json(build_prompt, temperature=0.8, max_tokens=1500)
+        items = await _call_gigachat_json(build_prompt, temperature=0.8, max_tokens=2200)
         if not isinstance(items, list):
             raise GenerationError("AI вернул структуру в неожиданном формате.")
 
@@ -382,7 +412,7 @@ async def generate_outline(
             items = await _call_gigachat_json(
                 lambda _e: build_prompt(None) + " ВАЖНО: в прошлый раз слова слиплись без пробелов — исправь это.",
                 temperature=0.6,
-                max_tokens=1500,
+                max_tokens=2200,
             )
             if not isinstance(items, list):
                 raise GenerationError("AI вернул структуру в неожиданном формате.")
@@ -513,7 +543,7 @@ async def generate_layout_content(
             f"{image_note}{error_note}"
         )
 
-    item = await _call_gigachat_json(build_prompt, temperature=0.7, max_tokens=1100)
+    item = await _call_gigachat_json(build_prompt, temperature=0.7, max_tokens=1500)
     if not isinstance(item, dict):
         raise GenerationError("AI вернул слайд в неожиданном формате.")
 
@@ -534,7 +564,7 @@ async def generate_layout_content(
                 "Не используй кавычки внутри текстовых значений вообще. Без markdown, только валидный JSON."
             )
 
-        item = await _call_gigachat_json(build_prompt_glued, temperature=0.5, max_tokens=1100)
+        item = await _call_gigachat_json(build_prompt_glued, temperature=0.5, max_tokens=1500)
         if not isinstance(item, dict):
             raise GenerationError("AI вернул слайд в неожиданном формате.")
 
