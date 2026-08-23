@@ -59,7 +59,8 @@ async def _fetch_from_pixabay(keywords: List[str]) -> Optional[str]:
         "image_type": "photo",
         "orientation": "horizontal",
         "safesearch": "true",
-        "per_page": 6,
+        "order": "popular",  # более узнаваемые/качественные фото вместо случайных по дате загрузки
+        "per_page": 15,
     }
 
     try:
@@ -81,7 +82,7 @@ async def _fetch_from_pixabay(keywords: List[str]) -> Optional[str]:
     if not hits:
         return None
 
-    photo = random.choice(hits[: min(3, len(hits))])
+    photo = hits[0]  # order=popular — берём самое релевантное/качественное, а не случайное
     return photo.get("largeImageURL") or photo.get("webformatURL")
 
 
