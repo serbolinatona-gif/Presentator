@@ -14,10 +14,10 @@ generators.py
                               раскладки (например, для "quote_context" — quote/context/
                               explanation, а не общие bullets).
 
-Устойчивость к JSON-ошибкам GigaChat (см. предыдущий фикс): модель имеет тенденцию по ошибке
-экранировать СТРУКТУРНЫЕ кавычки между элементами массива (например ["a\",\"b"] вместо
-["a","b"]). Поэтому промпт прямо запрещает использовать кавычки внутри текста вообще, а
-репар-парсер отдельно чинит именно этот паттерн.
+Устойчивость к JSON-ошибкам GigaChat: модель имеет тенденцию по ошибке экранировать
+СТРУКТУРНЫЕ кавычки между элементами массива, иногда забывает закрыть объект перед
+следующим в массиве, и часто обрезает ответ по лимиту токенов посреди вложенной
+структуры — для всего этого есть отдельные чинящие механизмы ниже.
 """
 
 import json
@@ -44,7 +44,7 @@ GIGACHAT_CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completion
 GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "false").lower() == "true"
 
 MAX_RETRIES = 3
-OUTLINE_BATCH_SIZE = 4  # уменьшено с 5: с более длинными промптами (анти-галлюцинации, грамотность)
+OUTLINE_BATCH_SIZE = 3  # уменьшено с 5: с более длинными промптами (анти-галлюцинации, грамотность)
                         # батч из 5 слайдов иногда обрезался по лимиту токенов
 
 _token_cache = {"access_token": None, "expires_at": 0}
@@ -238,20 +238,76 @@ def _repair_json(text: str) -> str:
 def _balance_brackets(text: str) -> str:
     """
     Последний рубеж защиты: если ответ обрезался по лимиту токенов (max_tokens),
-    JSON останется незакрытым. Досчитываем непарные кавычки/скобки в конце,
-    чтобы получить хоть что-то валидное (даже если последний элемент неполный —
-    это лучше, чем полный отказ).
+    JSON останется незакрытым. Раньше здесь была наивная версия ("сначала все },
+    потом все ]"), которая ломала порядок вложенности в структурах вида
+    {"parts": [{...}]} — теперь честно проходим по тексту стеком и закрываем
+    именно в обратном (LIFO) порядке открытия, плюс отслеживаем, не оборвался ли
+    текст прямо посреди строки (тогда сначала закрываем кавычку).
     """
     s = text
-    if s.count('"') % 2 == 1:
-        s += '"'
-    open_braces = s.count("{") - s.count("}")
-    open_brackets = s.count("[") - s.count("]")
-    if open_braces > 0:
-        s += "}" * open_braces
-    if open_brackets > 0:
-        s += "]" * open_brackets
-    return s
+    stack = []
+    in_string = False
+    escaped = False
+    for ch in s:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+
+    closers = {"{": "}", "[": "]"}
+    suffix = ""
+    if in_string:
+        suffix += '"'
+    suffix += "".join(closers[ch] for ch in reversed(stack))
+    return s + suffix
+
+
+def _trim_to_last_safe_comma(text: str) -> str:
+    """
+    Крайний случай: ответ оборвался прямо после ':' (ключ без значения) или в
+    середине незавершённого токена так, что даже балансировка скобок не спасает.
+    Обрезаем до последней "безопасной" запятой ВНЕ строки — то есть до последнего
+    полностью завершённого элемента — и уже оттуда закрываем скобки.
+    """
+    depth_stack = []
+    in_string = False
+    escaped = False
+    last_safe_comma = -1
+    for i, ch in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            depth_stack.append(ch)
+        elif ch in "}]":
+            if depth_stack:
+                depth_stack.pop()
+        elif ch == "," and depth_stack:
+            last_safe_comma = i
+    if last_safe_comma == -1:
+        return text
+    return text[:last_safe_comma]
 
 
 def _parse_json_loose(raw_text: str) -> Optional[object]:
@@ -267,6 +323,11 @@ def _parse_json_loose(raw_text: str) -> Optional[object]:
         pass
     try:
         return json.loads(_balance_brackets(repaired))
+    except json.JSONDecodeError:
+        pass
+    try:
+        trimmed = _trim_to_last_safe_comma(repaired)
+        return json.loads(_balance_brackets(trimmed))
     except json.JSONDecodeError:
         return None
 
@@ -404,7 +465,7 @@ async def generate_outline(
                 f"{error_note}"
             )
 
-        items = await _call_gigachat_json(build_prompt, temperature=0.6, max_tokens=2200)
+        items = await _call_gigachat_json(build_prompt, temperature=0.6, max_tokens=2600)
         if not isinstance(items, list):
             raise GenerationError("AI вернул структуру в неожиданном формате.")
 
@@ -413,7 +474,7 @@ async def generate_outline(
             items = await _call_gigachat_json(
                 lambda _e: build_prompt(None) + " ВАЖНО: в прошлый раз слова слиплись без пробелов — исправь это.",
                 temperature=0.6,
-                max_tokens=2200,
+                max_tokens=2600,
             )
             if not isinstance(items, list):
                 raise GenerationError("AI вернул структуру в неожиданном формате.")
@@ -546,7 +607,7 @@ async def generate_layout_content(
             f"{image_note}{error_note}"
         )
 
-    item = await _call_gigachat_json(build_prompt, temperature=0.45, max_tokens=1500)
+    item = await _call_gigachat_json(build_prompt, temperature=0.45, max_tokens=1900)
     if not isinstance(item, dict):
         raise GenerationError("AI вернул слайд в неожиданном формате.")
 
@@ -567,7 +628,7 @@ async def generate_layout_content(
                 "Не используй кавычки внутри текстовых значений вообще. Без markdown, только валидный JSON."
             )
 
-        item = await _call_gigachat_json(build_prompt_glued, temperature=0.5, max_tokens=1500)
+        item = await _call_gigachat_json(build_prompt_glued, temperature=0.5, max_tokens=1900)
         if not isinstance(item, dict):
             raise GenerationError("AI вернул слайд в неожиданном формате.")
 
